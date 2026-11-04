@@ -1,0 +1,1647 @@
+openapi: 3.1.0
+info:
+  title: Zaki Chat API
+  version: 1.0.0
+  description: HTTP contract maintained from the current implementation. Socket.IO events are documented in docs/socket-io.md.
+x-socketio-events:
+  conversation:read:
+    payload:
+      type: object
+      required:
+        - conversationId
+        - messageId
+      properties:
+        conversationId:
+          type: string
+          pattern: ^[0-9a-f]{24}$
+        messageId:
+          type: string
+          pattern: ^[0-9a-f]{24}$
+    successAck:
+      type: object
+      required:
+        - ok
+        - data
+      properties:
+        ok:
+          const: true
+        data:
+          type: object
+          required:
+            - conversation
+          properties:
+            conversation:
+              $ref: "#/components/schemas/Conversation"
+    errors:
+      "404": MESSAGE_NOT_FOUND when the message does not exist in the conversation.
+    description: Marks messages through messageId as read and delivered. Read/delivered markers are account-level high-water message IDs. Repeated reads that do not advance state do not broadcast conversation:updated.
+  typing:
+    payload:
+      type: object
+      required:
+        - conversationId
+        - isTyping
+      properties:
+        conversationId:
+          type: string
+          pattern: ^[0-9a-f]{24}$
+        isTyping:
+          type: boolean
+    serverEvent:
+      name: typing
+      payload:
+        type: object
+        required:
+          - conversationId
+          - isTyping
+        properties:
+          conversationId:
+            type: string
+            pattern: ^[0-9a-f]{24}$
+          isTyping:
+            type: boolean
+    description: Owner or the conversation's user may send it. It is forwarded only to the other party; owner self-conversation events are acknowledged and ignored. The server stores no typing state.
+  app:visibility:
+    payload:
+      type: object
+      required:
+        - visible
+      properties:
+        visible:
+          type: boolean
+        conversationId:
+          type: string
+          pattern: ^[0-9a-f]{24}$
+    successAck:
+      type: object
+      required:
+        - ok
+        - data
+      properties:
+        ok:
+          const: true
+        data:
+          type: "null"
+    description: Reports tab visibility and open conversation. Hidden tabs store no conversation; inaccessible conversations are silently ignored. State is per socket and does not affect presence.
+  presence:updated:
+    payload:
+      type: object
+      required:
+        - userId
+        - online
+        - lastSeenAt
+      properties:
+        userId:
+          type: string
+        online:
+          type: boolean
+        lastSeenAt:
+          type:
+            - string
+            - "null"
+          format: date-time
+    description: Owner-room event when an ordinary user's account changes online state. Presence is online while at least one socket is connected.
+  presence:snapshot:
+    payload:
+      type: object
+      required:
+        - onlineUserIds
+      properties:
+        onlineUserIds:
+          type: array
+          items:
+            type: string
+    description: Sent only to an owner socket when it connects; contains currently connected ordinary-user account IDs.
+  rateLimits:
+    windowMs: 10000
+    groups:
+      messages: 30
+      conversation:read: 60
+      typing: 40
+      other: 20
+    description: Limits are per socket. Exceeded non-typing events receive 429 RATE_LIMITED without disconnect. Excess typing events are silently dropped and acknowledged successfully.
+  lifecycle: The access-token expiry is checked at handshake only. Session activity is rechecked for each event; revoking one session disconnects its sockets and revoking all sessions disconnects all sockets for that account.
+  delivery: A message is delivered when its recipient account has an active socket, or when that account next connects. Read advances delivered too. The owner's personal conversation has unreadCount 0 and null peer markers, and receipt writes are skipped.
+x-web-push:
+  env:
+    - VAPID_PUBLIC_KEY
+    - VAPID_PRIVATE_KEY
+    - VAPID_SUBJECT
+  contract: PushPayload v1 is defined in src/modules/push/schemas/push-payload.schemas.ts. Messages and reactions target the other conversation participant; new-user targets the owner. Message/reaction pushes are suppressed while any visible socket views that conversation. New-user pushes are suppressed while any owner socket is visible. Until clients report app:visibility, defaults cause pushes to be sent.
+servers:
+  - url: /api/v1
+    description: Version 1 API
+tags:
+  - name: Health
+  - name: Auth
+  - name: Sessions
+  - name: Conversations
+  - name: Messages
+  - name: Uploads
+  - name: Users
+  - name: Push
+paths:
+  /push/config:
+    get:
+      tags:
+        - Push
+      summary: Get public Web Push configuration
+      description: Public endpoint. Returns enabled and the VAPID public key, or enabled=false and publicKey=null when disabled.
+      responses:
+        "200":
+          description: Success
+          content:
+            application/json:
+              schema:
+                type: object
+                required:
+                  - enabled
+                  - publicKey
+                properties:
+                  enabled:
+                    type: boolean
+                  publicKey:
+                    type:
+                      - string
+                      - "null"
+                  message:
+                    type: string
+        default: &a1
+          description: Operation-specific error; status and code depend on the failure.
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/ProblemDetails"
+  /push/subscriptions:
+    post:
+      tags:
+        - Push
+      summary: Register or reassign the current session's browser subscription
+      security: &a2
+        - bearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required:
+                - endpoint
+                - keys
+              properties:
+                endpoint:
+                  type: string
+                  format: uri
+                keys:
+                  type: object
+                  required:
+                    - p256dh
+                    - auth
+                  properties:
+                    p256dh:
+                      type: string
+                    auth:
+                      type: string
+      responses:
+        "204":
+          description: Subscription saved; no response body
+        "429":
+          $ref: "#/components/responses/RateLimited"
+        default: *a1
+    delete:
+      tags:
+        - Push
+      summary: Remove a subscription belonging to the current user and session
+      security: *a2
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required:
+                - endpoint
+              properties:
+                endpoint:
+                  type: string
+                  format: uri
+      responses:
+        "204":
+          description: Subscription removed; no response body
+        "429":
+          $ref: "#/components/responses/RateLimited"
+        default: *a1
+  /:
+    get:
+      servers:
+        - url: /
+      tags:
+        - Health
+      summary: Root greeting
+      responses:
+        "200":
+          description: Plain text greeting
+          content:
+            text/html:
+              schema:
+                type: string
+                example: Hello world
+        default: *a1
+  /health:
+    get:
+      servers:
+        - url: /
+      tags:
+        - Health
+      summary: Service and database health
+      responses:
+        "200":
+          description: Health status (database connected)
+          content:
+            application/json:
+              schema:
+                type: object
+                required:
+                  - status
+                  - db
+                properties:
+                  status:
+                    const: ok
+                  db:
+                    const: up
+        "503":
+          description: Service degraded (database disconnected)
+          content:
+            application/json:
+              schema:
+                type: object
+                required:
+                  - status
+                  - db
+                properties:
+                  status:
+                    const: degraded
+                  db:
+                    const: down
+        default:
+          description: Operation-specific error
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/ProblemDetails"
+  /auth/guest:
+    post:
+      tags:
+        - Auth
+      summary: Create a guest account and session
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/GuestRequest"
+      responses:
+        "201":
+          description: Session created; sets refresh_token cookie
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SessionResponse"
+        "403":
+          $ref: "#/components/responses/TurnstileFailed"
+        "422":
+          description: Validation failed
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/ProblemDetails"
+        "429":
+          $ref: "#/components/responses/RateLimited"
+        "500":
+          description: Unexpected server error
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/ProblemDetails"
+      parameters:
+        - $ref: "#/components/parameters/TurnstileHeader"
+  /auth/signup:
+    post:
+      tags:
+        - Auth
+      summary: Register an account and session
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/SignupRequest"
+      responses:
+        "201":
+          description: Account and session created; sets refresh_token cookie
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SessionResponse"
+        "403":
+          $ref: "#/components/responses/TurnstileFailed"
+        "409":
+          description: Username already taken
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/ProblemDetails"
+        "422":
+          description: Validation failed
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/ProblemDetails"
+        "429":
+          $ref: "#/components/responses/RateLimited"
+        "500":
+          description: Unexpected server error
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/ProblemDetails"
+      parameters:
+        - $ref: "#/components/parameters/TurnstileHeader"
+  /auth/login:
+    post:
+      tags:
+        - Auth
+      summary: Log in and create a session
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/LoginRequest"
+      responses:
+        "200":
+          description: Session created; sets refresh_token cookie
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SessionResponse"
+        "401":
+          description: Invalid credentials
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/ProblemDetails"
+        "403":
+          $ref: "#/components/responses/TurnstileFailed"
+        "422":
+          description: Validation failed
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/ProblemDetails"
+        "429":
+          $ref: "#/components/responses/RateLimited"
+        "500":
+          description: Unexpected server error
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/ProblemDetails"
+      parameters:
+        - $ref: "#/components/parameters/TurnstileHeader"
+  /auth/upgrade:
+    post:
+      tags:
+        - Auth
+      summary: Upgrade the authenticated guest account
+      security: *a2
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/UpgradeRequest"
+      responses:
+        "200":
+          description: Success
+          content:
+            application/json:
+              schema:
+                type: object
+                required:
+                  - user
+                properties:
+                  user:
+                    $ref: "#/components/schemas/User"
+        "403":
+          $ref: "#/components/responses/TurnstileFailed"
+        "409":
+          description: Already upgraded or username taken
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/ProblemDetails"
+        "429":
+          $ref: "#/components/responses/RateLimited"
+        default: *a1
+      parameters:
+        - $ref: "#/components/parameters/TurnstileHeader"
+  /auth/me:
+    get:
+      tags:
+        - Auth
+      summary: Get current user
+      security: *a2
+      responses:
+        "200":
+          description: Success
+          content:
+            application/json:
+              schema:
+                type: object
+                required:
+                  - user
+                properties:
+                  user:
+                    $ref: "#/components/schemas/User"
+        default: *a1
+  /auth/refresh:
+    post:
+      tags:
+        - Auth
+      summary: Rotate refresh token and issue access token
+      security:
+        - refreshCookie: []
+      responses:
+        "200":
+          description: Token refreshed; rotates refresh_token cookie
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SessionResponse"
+        "401":
+          description: Missing, expired, invalid, reused, or revoked refresh token
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/ProblemDetails"
+        "500":
+          description: Unexpected server error
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/ProblemDetails"
+  /auth/logout:
+    post:
+      tags:
+        - Auth
+      summary: Revoke refresh-token session if supplied
+      description: Public. The refresh_token cookie is optional; if present its session is revoked. The cookie is cleared in either case.
+      responses: &a3
+        "204": &a4
+          description: No content
+        "429":
+          $ref: "#/components/responses/RateLimited"
+        default: *a1
+  /auth/logout-all:
+    post:
+      tags:
+        - Auth
+      summary: Revoke all current user's sessions
+      security: *a2
+      responses: *a3
+  /auth/sessions:
+    get:
+      tags:
+        - Sessions
+      summary: List active sessions
+      security: *a2
+      responses:
+        "200":
+          description: Success
+          content:
+            application/json:
+              schema:
+                type: object
+                required:
+                  - sessions
+                properties:
+                  sessions:
+                    type: array
+                    items:
+                      $ref: "#/components/schemas/Session"
+        default: *a1
+  /auth/sessions/{id}:
+    delete:
+      tags:
+        - Sessions
+      summary: Revoke one of the current user's sessions
+      security: *a2
+      parameters:
+        - &a6
+          name: id
+          in: path
+          required: true
+          schema:
+            type: string
+            pattern: ^[0-9a-f]{24}$
+      responses:
+        "204": *a4
+        default: *a1
+  /conversations:
+    get:
+      tags:
+        - Conversations
+      summary: List conversations (owner only)
+      security: *a2
+      responses:
+        "200":
+          description: Success
+          content:
+            application/json:
+              schema:
+                type: object
+                required:
+                  - conversations
+                properties:
+                  conversations:
+                    type: array
+                    items:
+                      $ref: "#/components/schemas/Conversation"
+        "429":
+          $ref: "#/components/responses/RateLimited"
+        default: *a1
+  /conversations/me:
+    get:
+      tags:
+        - Conversations
+      summary: Get or create current user's conversation
+      parameters:
+        - name: x-lang
+          in: header
+          required: false
+          schema:
+            type: string
+            enum:
+              - ar
+              - en
+            default: ar
+          description: Preferred language for automatic welcome message upon conversation creation (ar or en)
+      security: *a2
+      responses:
+        "200":
+          description: Success
+          content:
+            application/json:
+              schema:
+                type: object
+                required:
+                  - conversation
+                properties:
+                  conversation:
+                    $ref: "#/components/schemas/Conversation"
+        "429":
+          $ref: "#/components/responses/RateLimited"
+        default: *a1
+  /conversations/{id}:
+    get:
+      tags:
+        - Conversations
+      summary: Get a conversation (owner or its user)
+      security: *a2
+      parameters:
+        - &a5
+          name: id
+          in: path
+          required: true
+          schema:
+            type: string
+            pattern: ^[0-9a-f]{24}$
+      responses:
+        "200":
+          description: Success
+          content:
+            application/json:
+              schema:
+                type: object
+                required:
+                  - conversation
+                properties:
+                  conversation:
+                    $ref: "#/components/schemas/Conversation"
+        "429":
+          $ref: "#/components/responses/RateLimited"
+        default: *a1
+  /conversations/{id}/pin:
+    patch:
+      tags:
+        - Conversations
+      summary: Pin a conversation (owner only)
+      security: *a2
+      parameters:
+        - *a5
+      responses:
+        "200":
+          description: Success
+          content:
+            application/json:
+              schema:
+                type: object
+                required:
+                  - conversation
+                properties:
+                  conversation:
+                    $ref: "#/components/schemas/Conversation"
+        "429":
+          $ref: "#/components/responses/RateLimited"
+        default: *a1
+    delete:
+      tags:
+        - Conversations
+      summary: Unpin a conversation (owner only)
+      security: *a2
+      parameters:
+        - *a5
+      responses:
+        "200":
+          description: Success
+          content:
+            application/json:
+              schema:
+                type: object
+                required:
+                  - conversation
+                properties:
+                  conversation:
+                    $ref: "#/components/schemas/Conversation"
+        "429":
+          $ref: "#/components/responses/RateLimited"
+        default: *a1
+  /conversations/{id}/messages:
+    get:
+      tags:
+        - Messages
+      summary: List conversation messages (owner or its user)
+      security: *a2
+      parameters:
+        - *a5
+        - name: before
+          in: query
+          required: false
+          description: Message ID cursor for loading older messages; use the prior response's nextCursor.
+          schema:
+            type: string
+            pattern: ^[0-9a-f]{24}$
+        - name: limit
+          in: query
+          required: false
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 100
+            default: 30
+      responses:
+        "200":
+          description: Success
+          content:
+            application/json:
+              schema:
+                type: object
+                required:
+                  - messages
+                  - nextCursor
+                properties:
+                  messages:
+                    type: array
+                    items:
+                      $ref: "#/components/schemas/Message"
+                  nextCursor:
+                    type:
+                      - string
+                      - "null"
+        "429":
+          $ref: "#/components/responses/RateLimited"
+        default: *a1
+    post:
+      tags:
+        - Messages
+      summary: Send a text or media message (owner or conversation user)
+      security: *a2
+      parameters:
+        - *a5
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/SendMessageRequest"
+      responses:
+        "201":
+          description: Message created
+          content:
+            application/json:
+              schema:
+                type: object
+                required:
+                  - message
+                properties:
+                  message:
+                    $ref: "#/components/schemas/Message"
+        "403":
+          description: Attachment is not owned by sender
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/ProblemDetails"
+        "404":
+          description: Reply target or uploaded file not found
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/ProblemDetails"
+        "422":
+          description: Invalid attachment or validation failed
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/ProblemDetails"
+        "429":
+          $ref: "#/components/responses/RateLimited"
+        default: *a1
+    delete:
+      tags:
+        - Messages
+      summary: Permanently clear conversation messages (owner only)
+      security: *a2
+      parameters:
+        - *a5
+      responses: *a3
+  /messages/{id}:
+    patch:
+      tags:
+        - Messages
+      summary: Edit a message (sender only)
+      security: *a2
+      parameters:
+        - *a6
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/TextRequest"
+      responses:
+        "200":
+          description: Success
+          content:
+            application/json:
+              schema:
+                type: object
+                required:
+                  - message
+                properties:
+                  message:
+                    $ref: "#/components/schemas/Message"
+        "429":
+          $ref: "#/components/responses/RateLimited"
+        default: *a1
+    delete:
+      tags:
+        - Messages
+      summary: Soft-delete a message (owner or sender)
+      security: *a2
+      parameters:
+        - *a6
+      responses:
+        "200":
+          description: Success
+          content:
+            application/json:
+              schema:
+                type: object
+                required:
+                  - message
+                properties:
+                  message:
+                    $ref: "#/components/schemas/Message"
+        "429":
+          $ref: "#/components/responses/RateLimited"
+        default: *a1
+  /messages/{id}/permanent:
+    delete:
+      tags:
+        - Messages
+      summary: Permanently delete a message (owner only)
+      security: *a2
+      parameters:
+        - *a6
+      responses: *a3
+  /messages/{id}/reactions:
+    post:
+      tags:
+        - Messages
+      summary: Add a reaction (owner or conversation user)
+      security: *a2
+      parameters:
+        - *a6
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/ReactionRequest"
+      responses:
+        "200":
+          description: Success
+          content:
+            application/json:
+              schema:
+                type: object
+                required:
+                  - message
+                properties:
+                  message:
+                    $ref: "#/components/schemas/Message"
+        "429":
+          $ref: "#/components/responses/RateLimited"
+        default: *a1
+  /messages/{id}/reactions/{emoji}:
+    delete:
+      tags:
+        - Messages
+      summary: Remove caller's reaction (owner or conversation user)
+      security: *a2
+      parameters:
+        - *a6
+        - name: emoji
+          in: path
+          required: true
+          description: One emoji; URL-encode path characters as required.
+          schema:
+            $ref: "#/components/schemas/Emoji"
+      responses:
+        "200":
+          description: Success
+          content:
+            application/json:
+              schema:
+                type: object
+                required:
+                  - message
+                properties:
+                  message:
+                    $ref: "#/components/schemas/Message"
+        "429":
+          $ref: "#/components/responses/RateLimited"
+        default: *a1
+  /uploads/presign:
+    post:
+      tags:
+        - Uploads
+      summary: Request a presigned Backblaze B2 upload URL
+      security: *a2
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/PresignUploadRequest"
+      responses:
+        "200":
+          description: Presigned URL and required upload method and headers
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/PresignUploadResponse"
+        "401":
+          description: Authentication required
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/ProblemDetails"
+        "422":
+          description: Validation failed
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/ProblemDetails"
+        "429":
+          $ref: "#/components/responses/RateLimited"
+  /users/me/avatar:
+    put:
+      tags:
+        - Users
+      summary: Set the current user's avatar from an uploaded B2 object
+      security: *a2
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/SetAvatarRequest"
+      responses:
+        "200":
+          description: Updated current user
+          content:
+            application/json:
+              schema:
+                type: object
+                required:
+                  - user
+                properties:
+                  user:
+                    $ref: "#/components/schemas/User"
+        "401":
+          description: Authentication required or user no longer exists
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/ProblemDetails"
+        "403":
+          description: Upload does not belong to the current user
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/ProblemDetails"
+        "404":
+          description: Uploaded object was not found
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/ProblemDetails"
+        "422":
+          description: Validation failed
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/ProblemDetails"
+        "429":
+          $ref: "#/components/responses/RateLimited"
+    delete:
+      tags:
+        - Users
+      summary: Remove the current user's avatar
+      security: *a2
+      responses:
+        "204":
+          description: Avatar removed
+        "401":
+          description: Authentication required or user no longer exists
+          content:
+            application/problem+json:
+              schema:
+                $ref: "#/components/schemas/ProblemDetails"
+        "429":
+          $ref: "#/components/responses/RateLimited"
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+      description: 15-minute access token in Authorization header.
+    refreshCookie:
+      type: apiKey
+      in: cookie
+      name: refresh_token
+      description: HttpOnly, SameSite=Strict, path=/auth; Secure in production. Refresh requires it; logout accepts it optionally.
+  schemas:
+    ProblemDetails:
+      type: object
+      required:
+        - type
+        - title
+        - status
+        - detail
+        - instance
+        - code
+      properties:
+        type:
+          type: string
+        title:
+          type: string
+        status:
+          type: integer
+        detail:
+          type: string
+        instance:
+          type: string
+        code:
+          type: string
+        errors:
+          type: object
+          additionalProperties:
+            type: array
+            items:
+              type: object
+              required:
+                - code
+                - message
+              properties:
+                code:
+                  type: string
+                message:
+                  type: string
+    GuestRequest:
+      type: object
+      required:
+        - name
+      properties:
+        name:
+          type: string
+          minLength: 1
+          maxLength: 20
+        turnstileToken:
+          type: string
+          description: Cloudflare Turnstile token from client widget (alternative to cf-turnstile-response header)
+    Username:
+      type: string
+      minLength: 2
+      maxLength: 20
+      pattern: ^[a-z0-9_]+$
+      description: Trimmed and lowercased before validation.
+    SignupRequest:
+      type: object
+      required:
+        - name
+        - username
+        - password
+      properties:
+        name:
+          type: string
+          minLength: 1
+          maxLength: 20
+        username:
+          $ref: "#/components/schemas/Username"
+        password:
+          type: string
+          minLength: 6
+          maxLength: 128
+        turnstileToken:
+          type: string
+          description: Cloudflare Turnstile token from client widget (alternative to cf-turnstile-response header)
+    LoginRequest:
+      type: object
+      required:
+        - username
+        - password
+      properties:
+        username:
+          $ref: "#/components/schemas/Username"
+        password:
+          type: string
+          minLength: 6
+          maxLength: 128
+        turnstileToken:
+          type: string
+          description: Cloudflare Turnstile token from client widget (alternative to cf-turnstile-response header)
+    UpgradeRequest:
+      type: object
+      required:
+        - username
+        - password
+      properties:
+        username:
+          $ref: "#/components/schemas/Username"
+        password:
+          type: string
+          minLength: 6
+          maxLength: 128
+        turnstileToken:
+          type: string
+          description: Cloudflare Turnstile token from client widget (alternative to cf-turnstile-response header)
+    TextRequest:
+      type: object
+      required:
+        - text
+      properties:
+        text:
+          type: string
+          minLength: 1
+          maxLength: 2000
+          description: Trimmed.
+    SendMessageRequest:
+      oneOf:
+        - type: object
+          required:
+            - text
+          properties:
+            text:
+              type: string
+              minLength: 1
+              maxLength: 2000
+              description: Trimmed.
+            replyToId:
+              type:
+                - string
+                - "null"
+              pattern: ^[0-9a-f]{24}$
+        - type: object
+          required:
+            - attachment
+          properties:
+            attachment:
+              oneOf:
+                - type: object
+                  required:
+                    - key
+                    - kind
+                    - originalName
+                    - size
+                  properties:
+                    key:
+                      type: string
+                      description: Presigned upload key.
+                    kind:
+                      enum:
+                        - image
+                        - video
+                    originalName:
+                      type: string
+                      maxLength: 255
+                    size:
+                      type: integer
+                      minimum: 1
+                      description: Client hint; stored size is authoritative.
+                - type: object
+                  required:
+                    - key
+                    - kind
+                    - size
+                    - durationSec
+                    - waveform
+                  properties:
+                    key:
+                      type: string
+                      description: Presigned upload key.
+                    kind:
+                      const: voice
+                    size:
+                      type: integer
+                      minimum: 1
+                      description: Client hint; stored size is authoritative.
+                    durationSec:
+                      type: number
+                      exclusiveMinimum: 0
+                    waveform:
+                      type: array
+                      minItems: 20
+                      maxItems: 80
+                      items:
+                        type: integer
+                        minimum: 0
+                        maximum: 100
+            caption:
+              type:
+                - string
+                - "null"
+              maxLength: 2000
+              description: Not allowed for voice messages.
+            replyToId:
+              type:
+                - string
+                - "null"
+              pattern: ^[0-9a-f]{24}$
+    ReactionRequest:
+      type: object
+      required:
+        - emoji
+      properties:
+        emoji:
+          $ref: "#/components/schemas/Emoji"
+    PresignUploadRequest:
+      type: object
+      required:
+        - purpose
+        - contentType
+        - size
+      properties:
+        purpose:
+          type: string
+          enum:
+            - avatar
+            - chat-media
+        contentType:
+          type: string
+          description: Codec parameters on supported audio types are normalized.
+          enum:
+            - image/jpeg
+            - image/png
+            - image/webp
+            - image/gif
+            - video/mp4
+            - video/webm
+            - video/quicktime
+            - audio/webm
+            - audio/ogg
+            - audio/mp4
+        size:
+          type: integer
+          minimum: 1
+          description: "Per-MIME limits: static images 2 MiB, GIF 10 MiB, video 50 MiB, voice 5 MiB."
+        originalName:
+          type: string
+          minLength: 1
+          maxLength: 255
+          description: Required for image and video; omitted for voice. Path parts are stripped.
+    PresignUploadResponse:
+      type: object
+      required:
+        - key
+        - url
+        - method
+        - headers
+      properties:
+        key:
+          type: string
+        url:
+          type: string
+          format: uri
+        method:
+          const: PUT
+        headers:
+          type: object
+          required:
+            - Content-Type
+            - Content-Length
+          properties:
+            Content-Type:
+              type: string
+            Content-Length:
+              type: string
+    SetAvatarRequest:
+      type: object
+      required:
+        - key
+      properties:
+        key:
+          type: string
+          minLength: 1
+          maxLength: 512
+    Emoji:
+      type: string
+      minLength: 1
+      maxLength: 32
+      description: Trimmed; must segment as one emoji, flag, or keycap.
+    User:
+      type: object
+      required:
+        - id
+        - name
+        - role
+        - username
+        - avatarUrl
+      properties:
+        id:
+          type: string
+        name:
+          type: string
+        role:
+          enum:
+            - owner
+            - user
+        username:
+          type:
+            - string
+            - "null"
+        avatarUrl:
+          type:
+            - string
+            - "null"
+          format: uri
+    SessionResponse:
+      type: object
+      required:
+        - accessToken
+        - user
+      properties:
+        accessToken:
+          type: string
+        user:
+          $ref: "#/components/schemas/User"
+    Session:
+      type: object
+      required:
+        - id
+        - ip
+        - userAgent
+        - createdAt
+        - lastSeenAt
+        - isCurrent
+      properties:
+        id:
+          type: string
+        ip:
+          type:
+            - string
+            - "null"
+        userAgent:
+          type:
+            - string
+            - "null"
+        createdAt:
+          type: string
+          format: date-time
+        lastSeenAt:
+          type: string
+          format: date-time
+        isCurrent:
+          type: boolean
+    Conversation:
+      type: object
+      required:
+        - id
+        - createdAt
+        - user
+        - lastMessageAt
+        - lastMessage
+        - pinnedAt
+        - unreadCount
+        - peerDeliveredUpTo
+        - peerReadUpTo
+      properties:
+        id:
+          type: string
+        createdAt:
+          type: string
+          format: date-time
+        user:
+          type: object
+          required:
+            - id
+            - name
+            - username
+            - avatarUrl
+          properties:
+            id:
+              type: string
+            name:
+              type: string
+            username:
+              type:
+                - string
+                - "null"
+            avatarUrl:
+              type:
+                - string
+                - "null"
+              format: uri
+            lastSeenAt:
+              type:
+                - string
+                - "null"
+              format: date-time
+              description: Included only in the owner view.
+        owner:
+          description: Included for non-owner user views and omitted for owner views.
+          oneOf:
+            - type: "null"
+            - type: object
+              required:
+                - id
+                - name
+                - avatarUrl
+              properties:
+                id:
+                  type: string
+                name:
+                  type: string
+                avatarUrl:
+                  type:
+                    - string
+                    - "null"
+                  format: uri
+        lastMessageAt:
+          type:
+            - string
+            - "null"
+          format: date-time
+        lastMessage:
+          oneOf:
+            - type: "null"
+            - $ref: "#/components/schemas/ConversationLastMessage"
+        pinnedAt:
+          type:
+            - string
+            - "null"
+          format: date-time
+        unreadCount:
+          type: integer
+          minimum: 0
+          description: Messages from the other party not yet read by the current account; always zero in the owner's personal conversation.
+        peerDeliveredUpTo:
+          type:
+            - string
+            - "null"
+          pattern: ^[0-9a-f]{24}$
+          description: Highest message ID delivered to the other party's account, or null.
+        peerReadUpTo:
+          type:
+            - string
+            - "null"
+          pattern: ^[0-9a-f]{24}$
+          description: Highest message ID read by the other party's account, or null.
+    ConversationLastMessage:
+      type: object
+      required:
+        - id
+        - senderId
+        - type
+        - deletedAt
+        - text
+        - durationSec
+        - media
+      properties:
+        id:
+          type: string
+        senderId:
+          type: string
+        type:
+          enum:
+            - text
+            - image
+            - video
+            - voice
+        deletedAt:
+          type:
+            - string
+            - "null"
+          format: date-time
+        text:
+          type:
+            - string
+            - "null"
+          description: Null for deleted messages viewed by a regular user.
+        durationSec:
+          type:
+            - number
+            - "null"
+        media:
+          oneOf:
+            - type: "null"
+            - $ref: "#/components/schemas/Media"
+    Message:
+      type: object
+      required:
+        - id
+        - conversationId
+        - senderId
+        - replyToId
+        - type
+        - createdAt
+        - text
+        - media
+        - reactions
+        - editedAt
+        - deletedAt
+      properties:
+        id:
+          type: string
+        conversationId:
+          type: string
+        senderId:
+          type: string
+        replyToId:
+          type:
+            - string
+            - "null"
+          pattern: ^[0-9a-f]{24}$
+        type:
+          enum:
+            - text
+            - image
+            - video
+            - voice
+        createdAt:
+          type: string
+          format: date-time
+        text:
+          type:
+            - string
+            - "null"
+          description: Null for deleted messages viewed by a regular user.
+        media:
+          oneOf:
+            - type: "null"
+            - $ref: "#/components/schemas/Media"
+        reactions:
+          type: array
+          items:
+            $ref: "#/components/schemas/Reaction"
+        editedAt:
+          type:
+            - string
+            - "null"
+          format: date-time
+        deletedAt:
+          type:
+            - string
+            - "null"
+          format: date-time
+        editHistory:
+          type: array
+          items:
+            $ref: "#/components/schemas/EditHistoryEntry"
+          description: Included for owner role; omitted for regular users.
+    Media:
+      type: object
+      required:
+        - url
+        - kind
+        - mimeType
+        - size
+      properties:
+        url:
+          type: string
+          format: uri
+          description: Signed GET URL, valid for one hour.
+        kind:
+          enum:
+            - image
+            - video
+            - voice
+        mimeType:
+          type: string
+        size:
+          type: integer
+          minimum: 1
+        originalName:
+          type: string
+        durationSec:
+          type: number
+          exclusiveMinimum: 0
+        waveform:
+          type: array
+          minItems: 20
+          maxItems: 80
+          items:
+            type: integer
+            minimum: 0
+            maximum: 100
+    Reaction:
+      type: object
+      required:
+        - userId
+        - emoji
+        - createdAt
+      properties:
+        userId:
+          type: string
+        emoji:
+          $ref: "#/components/schemas/Emoji"
+        createdAt:
+          type: string
+          format: date-time
+    EditHistoryEntry:
+      type: object
+      required:
+        - text
+        - editedAt
+      properties:
+        text:
+          type: string
+        editedAt:
+          type: string
+          format: date-time
+  parameters:
+    TurnstileHeader:
+      name: cf-turnstile-response
+      in: header
+      required: false
+      description: Cloudflare Turnstile token from client widget (alternative to body turnstileToken)
+      schema:
+        type: string
+  responses:
+    RateLimited:
+      description: Rate limit exceeded (RFC 7807 Problem Details)
+      headers:
+        Retry-After:
+          description: Seconds to wait before retrying
+          schema:
+            type: integer
+        RateLimit-Limit:
+          description: Maximum requests permitted in current window
+          schema:
+            type: integer
+        RateLimit-Remaining:
+          description: Remaining requests in current window
+          schema:
+            type: integer
+        RateLimit-Reset:
+          description: Seconds remaining until current window resets
+          schema:
+            type: integer
+        RateLimit-Policy:
+          description: Active rate limit quota and window definition
+          schema:
+            type: string
+      content:
+        application/problem+json:
+          schema:
+            $ref: "#/components/schemas/ProblemDetails"
+    TurnstileFailed:
+      description: Cloudflare Turnstile verification challenge required or failed (403 Forbidden)
+      content:
+        application/problem+json:
+          schema:
+            $ref: "#/components/schemas/ProblemDetails"

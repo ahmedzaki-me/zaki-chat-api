@@ -1,0 +1,416 @@
+asyncapi: "2.6.0"
+info:
+  title: Zaki Chat Realtime API (Socket.IO)
+  version: "1.0.0"
+  description: |
+    Official Real-time Event Specification for Zaki Chat API.
+    Powered by Socket.IO v4 over WebSocket-only transport (`transports: ["websocket"]`).
+    
+    ### Handshake Authentication
+    Connect with access token in the auth payload:
+    ```js
+    const socket = io("http://localhost:3000", {
+      transports: ["websocket"],
+      auth: { token: "<access-token>" }
+    });
+    ```
+    
+    ### Architecture & Rooms
+    - `user:<userId>`: Joined by all sockets belonging to that user.
+    - `session:<sessionId>`: Joined by all sockets belonging to that session.
+    - `owner`: Joined by owner sockets only.
+    - On every client event, the session activity is verified.
+    - Rate limits are applied per socket connection in 10-second fixed windows.
+
+servers:
+  development:
+    url: localhost:3000
+    protocol: ws
+    description: Development Socket.IO server
+  production:
+    url: api.zakichat.com
+    protocol: wss
+    description: Production Socket.IO server
+
+defaultContentType: application/json
+
+channels:
+  message:send:
+    description: Send a text message, media attachment, or voice note.
+    publish:
+      summary: Send Message (Client -> Server)
+      operationId: sendMessage
+      message:
+        $ref: "#/components/messages/MessageSendRequest"
+
+  message:edit:
+    description: Edit an existing message's text.
+    publish:
+      summary: Edit Message Text (Client -> Server)
+      operationId: editMessage
+      message:
+        $ref: "#/components/messages/MessageEditRequest"
+
+  message:delete:
+    description: Soft delete a message (content hidden from users, visible to owner).
+    publish:
+      summary: Soft Delete Message (Client -> Server)
+      operationId: softDeleteMessage
+      message:
+        $ref: "#/components/messages/MessageDeleteRequest"
+
+  message:delete-permanent:
+    description: Permanently delete a message (Owner only).
+    publish:
+      summary: Hard Delete Message (Client -> Server)
+      operationId: hardDeleteMessage
+      message:
+        $ref: "#/components/messages/MessageHardDeleteRequest"
+
+  reaction:add:
+    description: Add an emoji reaction to a message.
+    publish:
+      summary: Add Reaction (Client -> Server)
+      operationId: addReaction
+      message:
+        $ref: "#/components/messages/ReactionAddRequest"
+
+  reaction:remove:
+    description: Remove caller's emoji reaction from a message.
+    publish:
+      summary: Remove Reaction (Client -> Server)
+      operationId: removeReaction
+      message:
+        $ref: "#/components/messages/ReactionRemoveRequest"
+
+  conversation:read:
+    description: Advance read and delivered receipt markers up to a specific message ID.
+    publish:
+      summary: Mark Conversation as Read (Client -> Server)
+      operationId: markConversationRead
+      message:
+        $ref: "#/components/messages/ConversationReadRequest"
+
+  conversation:clear:
+    description: Permanently remove all messages in a conversation (Owner only).
+    publish:
+      summary: Clear Conversation (Client -> Server)
+      operationId: clearConversation
+      message:
+        $ref: "#/components/messages/ConversationClearRequest"
+
+  typing:
+    description: Ephemeral typing indicator forwarding.
+    publish:
+      summary: Send Typing State (Client -> Server)
+      operationId: sendTyping
+      message:
+        $ref: "#/components/messages/TypingSend"
+    subscribe:
+      summary: Receive Typing State (Server -> Client)
+      operationId: receiveTyping
+      message:
+        $ref: "#/components/messages/TypingEvent"
+
+  app:visibility:
+    description: Report client tab visibility and open conversation for Web Push suppression.
+    publish:
+      summary: Report Visibility (Client -> Server)
+      operationId: reportVisibility
+      message:
+        $ref: "#/components/messages/VisibilityReport"
+
+  message:new:
+    description: Broadcast when a new message is created.
+    subscribe:
+      summary: New Message Created (Server -> Client)
+      operationId: onNewMessage
+      message:
+        $ref: "#/components/messages/MessageNewEvent"
+
+  message:updated:
+    description: Broadcast when a message is edited, soft-deleted, or has reaction changes.
+    subscribe:
+      summary: Message Updated (Server -> Client)
+      operationId: onMessageUpdated
+      message:
+        $ref: "#/components/messages/MessageUpdatedEvent"
+
+  message:deleted:
+    description: Broadcast when a message is permanently deleted.
+    subscribe:
+      summary: Message Permanently Deleted (Server -> Client)
+      operationId: onMessageDeleted
+      message:
+        $ref: "#/components/messages/MessageDeletedEvent"
+
+  conversation:updated:
+    description: Broadcast when conversation metadata, receipts, or preview change.
+    subscribe:
+      summary: Conversation Updated (Server -> Client)
+      operationId: onConversationUpdated
+      message:
+        $ref: "#/components/messages/ConversationUpdatedEvent"
+
+  conversation:cleared:
+    description: Broadcast when all messages in a conversation are cleared.
+    subscribe:
+      summary: Conversation Cleared (Server -> Client)
+      operationId: onConversationCleared
+      message:
+        $ref: "#/components/messages/ConversationClearedEvent"
+
+  presence:updated:
+    description: Sent to Owner room when an ordinary user connects or disconnects.
+    subscribe:
+      summary: User Presence Updated (Server -> Owner)
+      operationId: onPresenceUpdated
+      message:
+        $ref: "#/components/messages/PresenceUpdatedEvent"
+
+  presence:snapshot:
+    description: Sent to Owner socket upon connection with online user IDs.
+    subscribe:
+      summary: Online Users Snapshot (Server -> Owner)
+      operationId: onPresenceSnapshot
+      message:
+        $ref: "#/components/messages/PresenceSnapshotEvent"
+
+components:
+  messages:
+    MessageSendRequest:
+      title: MessageSendRequest
+      payload:
+        type: object
+        required: [conversationId]
+        properties:
+          conversationId:
+            type: string
+            pattern: "^[0-9a-f]{24}$"
+          text:
+            type: string
+            minLength: 1
+            maxLength: 2000
+          caption:
+            type: string
+            maxLength: 2000
+          replyToId:
+            type: string
+            pattern: "^[0-9a-f]{24}$"
+          attachment:
+            type: object
+            required: [key, kind, size]
+            properties:
+              key:
+                type: string
+              kind:
+                type: string
+                enum: [image, video, voice]
+              originalName:
+                type: string
+              size:
+                type: integer
+                minimum: 1
+              durationSec:
+                type: number
+                exclusiveMinimum: 0
+                description: Voice note duration in seconds (no arbitrary cap).
+              waveform:
+                type: array
+                items:
+                  type: integer
+                  minimum: 0
+                  maximum: 100
+                minItems: 20
+                maxItems: 80
+
+    MessageEditRequest:
+      title: MessageEditRequest
+      payload:
+        type: object
+        required: [id, text]
+        properties:
+          id:
+            type: string
+            pattern: "^[0-9a-f]{24}$"
+          text:
+            type: string
+            minLength: 1
+            maxLength: 2000
+
+    MessageDeleteRequest:
+      title: MessageDeleteRequest
+      payload:
+        type: object
+        required: [id]
+        properties:
+          id:
+            type: string
+            pattern: "^[0-9a-f]{24}$"
+
+    MessageHardDeleteRequest:
+      title: MessageHardDeleteRequest
+      payload:
+        type: object
+        required: [id]
+        properties:
+          id:
+            type: string
+            pattern: "^[0-9a-f]{24}$"
+
+    ReactionAddRequest:
+      title: ReactionAddRequest
+      payload:
+        type: object
+        required: [id, emoji]
+        properties:
+          id:
+            type: string
+            pattern: "^[0-9a-f]{24}$"
+          emoji:
+            type: string
+            maxLength: 32
+
+    ReactionRemoveRequest:
+      title: ReactionRemoveRequest
+      payload:
+        type: object
+        required: [id, emoji]
+        properties:
+          id:
+            type: string
+            pattern: "^[0-9a-f]{24}$"
+          emoji:
+            type: string
+            maxLength: 32
+
+    ConversationReadRequest:
+      title: ConversationReadRequest
+      payload:
+        type: object
+        required: [conversationId, messageId]
+        properties:
+          conversationId:
+            type: string
+            pattern: "^[0-9a-f]{24}$"
+          messageId:
+            type: string
+            pattern: "^[0-9a-f]{24}$"
+
+    ConversationClearRequest:
+      title: ConversationClearRequest
+      payload:
+        type: object
+        required: [conversationId]
+        properties:
+          conversationId:
+            type: string
+            pattern: "^[0-9a-f]{24}$"
+
+    TypingSend:
+      title: TypingSend
+      payload:
+        type: object
+        required: [conversationId, isTyping]
+        properties:
+          conversationId:
+            type: string
+            pattern: "^[0-9a-f]{24}$"
+          isTyping:
+            type: boolean
+
+    TypingEvent:
+      title: TypingEvent
+      payload:
+        type: object
+        required: [conversationId, isTyping]
+        properties:
+          conversationId:
+            type: string
+          isTyping:
+            type: boolean
+
+    VisibilityReport:
+      title: VisibilityReport
+      payload:
+        type: object
+        required: [visible]
+        properties:
+          visible:
+            type: boolean
+          conversationId:
+            type: string
+            pattern: "^[0-9a-f]{24}$"
+
+    MessageNewEvent:
+      title: MessageNewEvent
+      payload:
+        type: object
+        required: [message]
+        properties:
+          message:
+            type: object
+
+    MessageUpdatedEvent:
+      title: MessageUpdatedEvent
+      payload:
+        type: object
+        required: [message]
+        properties:
+          message:
+            type: object
+
+    MessageDeletedEvent:
+      title: MessageDeletedEvent
+      payload:
+        type: object
+        required: [id, conversationId]
+        properties:
+          id:
+            type: string
+          conversationId:
+            type: string
+
+    ConversationUpdatedEvent:
+      title: ConversationUpdatedEvent
+      payload:
+        type: object
+        required: [conversation]
+        properties:
+          conversation:
+            type: object
+
+    ConversationClearedEvent:
+      title: ConversationClearedEvent
+      payload:
+        type: object
+        required: [conversationId]
+        properties:
+          conversationId:
+            type: string
+
+    PresenceUpdatedEvent:
+      title: PresenceUpdatedEvent
+      payload:
+        type: object
+        required: [userId, online, lastSeenAt]
+        properties:
+          userId:
+            type: string
+          online:
+            type: boolean
+          lastSeenAt:
+            type: string
+            format: date-time
+            nullable: true
+
+    PresenceSnapshotEvent:
+      title: PresenceSnapshotEvent
+      payload:
+        type: object
+        required: [onlineUserIds]
+        properties:
+          onlineUserIds:
+            type: array
+            items:
+              type: string
